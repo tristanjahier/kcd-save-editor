@@ -1,6 +1,6 @@
 """Decompress Kingdom Come: Deliverance (1) .whs saves into their raw payload.
 
-The payload is what ksy/kcd_save_payload.ksy describes: open it in the Kaitai
+The payload is what kcd_save_payload.ksy describes: open it in the Kaitai
 Web IDE (https://ide.kaitai.io) together with that spec.
 
 Usage: python whs_decompress.py SAVE.whs [SAVE.whs ...] [-o OUTPUT_DIR]

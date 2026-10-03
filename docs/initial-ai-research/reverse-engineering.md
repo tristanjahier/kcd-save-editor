@@ -1618,10 +1618,10 @@ The 8 reference saves, in date order. A parser can be checked against these valu
 
 | File | What it does |
 |---|---|
-| [`inspect_save.py`](../inspect_save.py) | Shows everything known about one save; options `--section`, `--layers`, `--souls`, `--tree`, `--lang` |
-| [`compare_saves.py`](../compare_saves.py) | Shows what changed between saves: modules, chunks, layers, statistics |
-| [`whs_decompress.py`](../whs_decompress.py) | Writes a save's decompressed payload to a file and checks its MD5 |
-| [`build_field_names.py`](../build_field_names.py) | Rebuilds the field-name dictionary from the game's `WHGame.dll` |
+| [`inspect_save.py`](inspect_save.py) | Shows everything known about one save; options `--section`, `--layers`, `--souls`, `--tree`, `--lang` |
+| [`compare_saves.py`](compare_saves.py) | Shows what changed between saves: modules, chunks, layers, statistics |
+| [`whs_decompress.py`](whs_decompress.py) | Writes a save's decompressed payload to a file and checks its MD5 |
+| [`build_field_names.py`](build_field_names.py) | Rebuilds the field-name dictionary from the game's `WHGame.dll` |
 
 ## Terms
 

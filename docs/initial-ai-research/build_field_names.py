@@ -3,7 +3,7 @@
 Typed values in a save only store a 32-bit FNV-1 hash of their field name. The
 names are string literals in the game's WHGame.dll: this tool hashes every
 string of the DLL, keeps the ones whose hash occurs in the given saves, and
-writes them into the `field_name` enum of ksy/kcd_save_payload.ksy. Names
+writes them into the `field_name` enum of kcd_save_payload.ksy. Names
 already in the enum are kept, so it can be re-run on new saves or after a game
 update.
 
@@ -21,7 +21,7 @@ from pathlib import Path
 from whs_decompress import decompress
 
 DEFAULT_DLL = Path("C:/Program Files (x86)/Steam/steamapps/common/KingdomComeDeliverance/Bin/Win64/WHGame.dll")
-DEFAULT_KSY = Path(__file__).with_name("ksy") / "kcd_save_payload.ksy"
+DEFAULT_KSY = Path(__file__).with_name("kcd_save_payload.ksy")
 BEGIN_MARKER = "  # BEGIN field_name"
 END_MARKER = "  # END field_name"
 ENTRY = re.compile(r'^\s+0x([0-9a-f]{8}): \{id: ([a-z][a-z0-9_]*), doc: "((?:[^"\\]|\\.)*)"\}(.*)$')

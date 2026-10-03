@@ -21,7 +21,7 @@ doc: |
   are optional (mod list, switch save number, active dynamic events) and
   patches add new ones (module 29464 appeared with game version 1.9.7/1.9.8).
 
-  Names follow docs/reverse-engineering.md, adapted to the KSY style guide
+  Names follow reverse-engineering.md, adapted to the KSY style guide
   (lowercase type names, num_/len_ prefixes for counts and sizes).
 
   Parses all the saves of one playthrough (game versions 1.9.6 and 1.9.8),
