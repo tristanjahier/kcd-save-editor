@@ -316,3 +316,86 @@ footer :=
 ```
 
 A refined, ready-to-use version of the script above is available in [`read_save_footer.py`](read_save_footer.py).
+
+
+#### Decoding the rest of the file
+
+Now back to the `CReader::ReadBinaryFile` function in `Code/CryEngine/CryAction/Serialization/XMLCPBin/Reader/XMLCPB_Reader.cpp`.
+
+Lines 249-251 show that the save bytes' integrity is verified. This verification only happens on Windows (see lines 29-31 in `XMLCPB_Common.h`).
+```cpp
+#ifdef XMLCPB_CHECK_FILE_INTEGRITY
+    m_errorReading = CheckFileCorruption(pOSSaveReader, fileHeader, m_totalSize);
+#endif
+```
+
+In `CheckFileCorruption` (lines 304-354), we can see that:
+1. First it checks  the size of the save. It must be more than the size of the footer (`SFileHeader`, 64 bytes).
+2. Then the MD5 signature is computed on all the save's bytes (after decryption, if any), including the footer, but with the MD5 signature's 16 bytes all zeroed. If this hash is not byte-for-byte equal to the hash embedded in the footer, it fails.
+
+At line 253 it moves the cursor to the beginning of the file again.
+
+Then, at lines 255-259, it verifies that the `m_fileTypeCheck` member of the decoded `SFileHeader` is equal to its default value, `'PBX0'`, otherwise it aborts reading. It confirms that `'PBX0'` is an identity marker of the footer, and that we MUST find it every time.
+
+##### The "nodes buffer"
+
+Continuing forward, lines 263-265 fill a buffer via the "buffer reader" (`SBufferReader m_buffer`):
+```cpp
+m_nodesDataSize = fileHeader.m_sizeNodes;
+m_numNodes = fileHeader.m_numNodes;
+m_buffer.ReadFromFile(*this, pOSSaveReader, fileHeader.m_sizeNodes);
+```
+
+Digging into `SBufferReader::ReadFromFile`, we can see that it allocates new memory for its buffer using its `m_pHeap` member. The constructor of `CReader` shows that this pointer is shared between those two objects. After allocating memory it calls back `CReader::ReadDataFromFile` with a pointer to the start of its newly allocated buffer.
+
+`CReader::ReadDataFromFile` checks the engine's CVar `g_XMLCPBUseExtraZLibCompression`:
+- If enabled it will decompress blocks of bytes using Zlib until the next `m_sizeNodes` bytes are all decompressed. Each block has a header (`SZLibBlockHeader`), which carries information about its size and whether it is compressed or not. Raw or decompressed data is stored in an intermediate buffer named `m_pZLibBuffer`. Header bytes are not copied over.
+- If disabled, bytes are copied as-is in memory via `ReadDataFromFileInternal`, which we already analyzed earlier.
+
+Note: `g_XMLCPBUseExtraZLibCompression` is enabled by default, as seen in `Code/CryEngine/CryAction/CryActionCVars.cpp` at line 60.
+
+In the end, the raw or decompressed data is stored in `SBufferReader::m_pBuffer`. This buffer holds something called "nodes", even though we don't know what it is yet.
+
+##### The "string tables"
+
+Immediately after, lines 266-268 read the 3 "string tables" mentioned in `SFileHeader`, of type `CStringTableReader`.
+```cpp
+m_tableTags.ReadFromFile(*this, pOSSaveReader, fileHeader.m_tags);
+m_tableAttrNames.ReadFromFile(*this, pOSSaveReader, fileHeader.m_attrNames);
+m_tableStrData.ReadFromFile(*this, pOSSaveReader, fileHeader.m_strData);
+```
+
+`m_tableTags` is an instance of `CStringTableReader`. Digging into its `ReadFromFile` method:
+1. It allocates new memory to house the `m_numStrings` string addresses.
+2. It gets those string addresses (`FlatAddr`) by reading the next `sizeof(FlatAddr) * m_numStrings` bytes through `CReader::ReadDataFromFile`.
+3. It appears to swap byte order for all string addresses. But reading lines 256-282 in `XMLCPB_Common.h` shows that it actually does nothing at all.
+4. It uses its buffer reader (`SBufferReader`) to allocate memory in the heap for those "strings" data, then hands off to `CReader::ReadDataFromFile` again to read the next `m_sizeStringData` bytes.
+
+The same applies for `m_tableAttrNames` and `m_tableStrData`.
+
+##### The "attribute sets table"
+
+Next, line 269 reads the "table of attribute sets":
+```cpp
+m_tableAttrSets.ReadFromFile(*this, pOSSaveReader, fileHeader);
+```
+
+`m_tableAttrSets` is an instance of `CAttrSetTableReader`. Digging into its `ReadFromFile` method:
+1. It gets its `m_numAttrs` by reading the next `sizeof(uint8) * m_numAttrSets` bytes through `CReader::ReadDataFromFile`. It is a table of the number of attributes per set (source: line 20 in `XMLCPB_AttrSetTableReader.cpp`).
+2. It gets its `m_setAddrs` by reading the next `sizeof(FlatAddr16) * m_numAttrSets` bytes through `CReader::ReadDataFromFile`. It is a table of the addresses of attribute sets (source: method `GetHeaderAttr`, lines 32-41 in `XMLCPB_AttrSetTableReader.cpp`).
+3. It uses its buffer reader (`SBufferReader`) to read the next `m_sizeAttrSets` bytes which are the "attribute sets" data.
+
+##### The "node addresses table"
+
+Next, line 270:
+```cpp
+CreateNodeAddressTables();
+```
+
+This method parses each node from `CReader`'s buffer using `CNodeLiveReader` just to get the address of the next one (presumably because nodes are variable-length and need to be parsed in order to tell where they start and end). Those addresses are stored in `m_nodesAddrTable`. Node objects are just discarded.
+
+Finally, `CReader::ReadBinaryFile` "activates" the root node (we do not know what it means, and that is probably unimportant at that step), and "touches" the file to mark it as the most recent loaded savegame (could be used for the "Continue" button in the main menu).
+
+##### Conclusion
+
+All the data-loading steps described above depend on fields (`m_sizeNodes`, `m_numNodes`, `m_numAttrSets`, `m_sizeAttrSets` etc.) that are all zeros in the save files of our sample. It would mean that, according to CryEngine's savegame loading code, those save files should be empty apart from their 64-byte footer, which is obviously untrue because they typically weigh more than 5 MiB and they are recognized by the game. So it looks like KCD does not strictly comply with CryEngine's XMLCPB save format, or maybe just not this one from version 5.7.
