@@ -2,6 +2,8 @@
 
 This guide was written using a sample of over a dozen actual save files made on the Windows version of Kingdom Come: Deliverance (the first one) version 1.9.6+.
 
+Saved games are `.whs` files located at `%USERPROFILE%\Saved Games\kingdomcome\saves\playline<N>`.
+
 ## The game engine
 
 Our first lead is the game engine. Game engines may offer tools to serialize the state of the game world, and in the case of an open-world game like Kingdom Come: Deliverance, it could be useful to save the state of hundreds of NPCs (their locations, statistics and inventories), the contents of chests, the progress of quests and objectives, the items dropped on the ground, etc.
@@ -315,10 +317,10 @@ footer :=
     [ 3 | ...]
 ```
 
-A refined, ready-to-use version of the script above is available in [`read_save_footer.py`](read_save_footer.py).
+A refined, ready-to-use version of the script above is available in [`read_footer.py`](read_footer.py).
 
 
-#### Decoding the rest of the file
+#### Decoding the rest of the save loading logic
 
 Now back to the `CReader::ReadBinaryFile` function in `Code/CryEngine/CryAction/Serialization/XMLCPBin/Reader/XMLCPB_Reader.cpp`.
 
@@ -349,7 +351,7 @@ m_buffer.ReadFromFile(*this, pOSSaveReader, fileHeader.m_sizeNodes);
 Digging into `SBufferReader::ReadFromFile`, we can see that it allocates new memory for its buffer using its `m_pHeap` member. The constructor of `CReader` shows that this pointer is shared between those two objects. After allocating memory it calls back `CReader::ReadDataFromFile` with a pointer to the start of its newly allocated buffer.
 
 `CReader::ReadDataFromFile` checks the engine's CVar `g_XMLCPBUseExtraZLibCompression`:
-- If enabled it will decompress blocks of bytes using Zlib until the next `m_sizeNodes` bytes are all decompressed. Each block has a header (`SZLibBlockHeader`), which carries information about its size and whether it is compressed or not. Raw or decompressed data is stored in an intermediate buffer named `m_pZLibBuffer`. Header bytes are not copied over.
+- If enabled it will decompress blocks of bytes using zlib until the next `m_sizeNodes` bytes are all decompressed. Each block has a header (`SZLibBlockHeader`), which carries information about its size and whether it is compressed or not. Raw or decompressed data is stored in an intermediate buffer named `m_pZLibBuffer`. Header bytes are not copied over.
 - If disabled, bytes are copied as-is in memory via `ReadDataFromFileInternal`, which we already analyzed earlier.
 
 Note: `g_XMLCPBUseExtraZLibCompression` is enabled by default, as seen in `Code/CryEngine/CryAction/CryActionCVars.cpp` at line 60.
@@ -399,3 +401,125 @@ Finally, `CReader::ReadBinaryFile` "activates" the root node (we do not know wha
 ##### Conclusion
 
 All the data-loading steps described above depend on fields (`m_sizeNodes`, `m_numNodes`, `m_numAttrSets`, `m_sizeAttrSets` etc.) that are all zeros in the save files of our sample. It would mean that, according to CryEngine's savegame loading code, those save files should be empty apart from their 64-byte footer, which is obviously untrue because they typically weigh more than 5 MiB and they are recognized by the game. So it looks like KCD does not strictly comply with CryEngine's XMLCPB save format, or maybe just not this one from version 5.7.
+
+#### Decoding the rest of the binary
+
+So, we cannot use most of the footer's data to decode the rest of the binary save file... which is annoying. Yet the presence of the footer in all tested KCD saves hints that we are on the right track.
+
+All the data-loading functions that we studied earlier rely on `CReader::ReadDataFromFile` to get their bytes before interpreting them. In particular, if enabled it decompresses the payload block by block using zlib. This processing step is independent of any later cutting and interpretation of the bytes, so we can try to work it out first.
+
+Let's assume that zlib compression is indeed enabled in KCD, and look at what `CReader::ReadDataFromZLibBuffer` does in that case. At lines 173-174, we can see that it expects to find a header structure (`SZLibBlockHeader`, defined in `XMLCPB_Common.h` at lines 90-95) at the start of a compressed block:
+```cpp
+SZLibBlockHeader blockHeader;
+ReadDataFromFileInternal(pOSSaveReader, &blockHeader, sizeof(blockHeader));
+```
+
+Using the same rules that we detailed in the first part of this guide, we can compute that `SZLibBlockHeader` takes 8 bytes in memory (2 x uint32, alignment of 4). If KCD saves are compressed like CryEngine does, we should find `m_compressedSize` at offset 0 and `m_uncompressedSize` at offset 4.
+
+In an example save:
+- `m_compressedSize`: `D0 20 00 00`, which translates as `8400` in uint32 little-endian.
+- `m_uncompressedSize`: `00 80 00 00`, which translates as `32768` in uint32 little-endian.
+
+To interpret those values, we need to move forward in `CReader::ReadDataFromZLibBuffer`, at line 177:
+```cpp
+bool isCompressedData = blockHeader.m_compressedSize != SZLibBlockHeader::NO_ZLIB_USED;
+```
+
+It means that the following block data is raw (uncompressed) if `m_compressedSize` equals `0xffffffff`.
+
+In our example that is not the case. So we can expect the block to span 8400 bytes after its header. And after those 8400 bytes, we should find another block header structure. That second block header would be:
+- `m_compressedSize`: `71 1B 00 00`, which translates as `7025` in uint32 little-endian.
+- `m_uncompressedSize`: `00 80 00 00`, which translates as `32768` in uint32 little-endian.
+
+That is fitting! The fact that `m_uncompressedSize` would always be 32768 would be very coherent: one would split the raw payload into blocks of the same size before compressing them, so the compressed size could vary but the uncompressed size would always be the same by design, apart from the trailing block.
+
+Following the same logic three more times gives comparable and consistent results, with `m_uncompressedSize` always equal to `00 80 00 00`. But it could still be chance. However, line 50 in `XMLCPB_Common.h` defines the `XMLCPB_ZLIB_BUFFER_SIZE` constant as 32768. We will not go into detail about it, but we can find evidence in `CReader` that it is the maximum size of a decompressed block. This makes chance unlikely.
+
+This Python script automates finding these block headers:
+```python
+from argparse import ArgumentParser
+from io import SEEK_SET
+import os
+
+FOOTER_SIZE = 64  # in bytes
+ZLIB_BLOCK_HEADER_SIZE = 8  # in bytes
+NO_ZLIB_USED_FLAG = 0xffffffff
+
+parser = ArgumentParser()
+parser.add_argument("savefile")
+args = parser.parse_args()
+
+file_size = os.stat(args.savefile).st_size
+offset: int = 0  # the next block offset
+block_i: int = 0
+
+with open(args.savefile, "rb") as file:
+    while offset <= (file_size - FOOTER_SIZE - ZLIB_BLOCK_HEADER_SIZE):
+        file.seek(offset, SEEK_SET)
+        block_header_bytes = file.read(ZLIB_BLOCK_HEADER_SIZE)
+        compressed_size = int.from_bytes(block_header_bytes[:4], byteorder="little", signed=False)
+        uncompressed_size = int.from_bytes(block_header_bytes[4:], byteorder="little", signed=False)
+        block_size = compressed_size if compressed_size != NO_ZLIB_USED_FLAG else uncompressed_size
+
+        print(f"Block {block_i}, offset {hex(offset)}")
+        print(f"  m_compressedSize = {compressed_size}")
+        print(f"  m_uncompressedSize = {uncompressed_size}")
+
+        offset += ZLIB_BLOCK_HEADER_SIZE + block_size
+        block_i += 1
+```
+
+The crucial question we must answer now is: do those bytes actually decompress correctly using zlib?
+
+First, let's check how CryEngine decompresses them, at line 186:
+```cpp
+bool ok = gEnv->pSystem->DecompressDataBlock(m_pZLibCompressedBuffer, blockHeader.m_compressedSize, m_pZLibBuffer, uncompressedLength);
+```
+
+It calls `CSystem::DecompressDataBlock`, which in turn calls zlib's `uncompress` function. In Python, the equivalent is `zlib.decompress()`.
+
+We can modify the Python script like so:
+```python
+import zlib
+...
+
+with open(args.savefile, "rb") as file:
+    while offset <= (file_size - FOOTER_SIZE - ZLIB_BLOCK_HEADER_SIZE):
+        ...
+
+        print(f"Block {block_i}, offset {hex(offset)}")
+        print(f"  m_compressedSize = {compressed_size}")
+        print(f"  m_uncompressedSize = {uncompressed_size}")
+
+        if compressed_size != NO_ZLIB_USED_FLAG:
+            try:
+                decompressed_bytes = zlib.decompress(file.read(block_size))
+                print("  zlib decompression OK")
+                if len(decompressed_bytes) != uncompressed_size:
+                    print("  \033[31mDeclared uncompressed size does not check out\033[0m")
+            except zlib.error as e:
+                print(f"  \033[31mzlib decompression failed! {e}\033[0m")
+
+        offset += ZLIB_BLOCK_HEADER_SIZE + block_size
+        block_i += 1
+```
+
+It checks that blocks decompress without errors using zlib, and that their decompressed size equals what was declared in the header.
+
+We should also add this check at the end, to ensure that the last block finishes exactly where the file footer starts.
+```python
+with open(args.savefile, "rb") as file:
+    while offset <= (file_size - FOOTER_SIZE - ZLIB_BLOCK_HEADER_SIZE):
+        ...
+
+    if offset < (file_size - FOOTER_SIZE):
+        print("\033[31mLast block's declared size leaves a few trailing bytes before the footer!\033[0m")
+    elif offset > (file_size - FOOTER_SIZE):
+        print("\033[31mLast block's declared size overlaps the footer!\033[0m")
+```
+
+If we run this script on our sample saves, it finds no errors at all. We now have the proof that the rest of the binary payload consists of blocks of zlib-compressed data, as described in CryEngine's code.
+
+*Note: inspecting each zlib block shows that all of them start with those 2 bytes: `78 5E` (if compressed). It is a strong marker of zlib, as it is a header that tells the compression mode ([see Wikipedia's List of file signatures](https://en.wikipedia.org/wiki/List_of_file_signatures), and [RFC 1950 section 2.2 "Data format"](https://www.rfc-editor.org/info/rfc1950/#section-2)).*
+
+A refined, ready-to-use version of the script above is available in [`read_zlib_blocks.py`](read_zlib_blocks.py).
