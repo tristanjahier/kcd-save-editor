@@ -1,4 +1,5 @@
 from argparse import ArgumentParser
+from contextlib import nullcontext
 from io import SEEK_SET
 import zlib
 from sys import stderr
@@ -10,6 +11,7 @@ NO_ZLIB_USED_FLAG = 0xffffffff
 
 parser = ArgumentParser()
 parser.add_argument("savefile")
+parser.add_argument("--decompress", action="store_true", help="write '<input file stem>.decompressed.bin' with concatenated decompressed blocks")
 args = parser.parse_args()
 savefile = Path(args.savefile).resolve()
 
@@ -21,7 +23,12 @@ file_size = savefile.stat().st_size
 offset: int = 0  # the next block offset
 block_i: int = 0
 
-with savefile.open("rb") as file:
+decompressed_output_path = savefile.with_suffix(".decompressed.bin")
+
+with (
+    savefile.open("rb") as file,
+    decompressed_output_path.open("wb") if args.decompress else nullcontext() as output
+):
     while offset <= (file_size - FOOTER_SIZE - ZLIB_BLOCK_HEADER_SIZE):
         file.seek(offset, SEEK_SET)
         block_header_bytes = file.read(ZLIB_BLOCK_HEADER_SIZE)
@@ -39,8 +46,12 @@ with savefile.open("rb") as file:
                 print("  zlib decompression OK")
                 if len(decompressed_bytes) != uncompressed_size:
                     print("  \033[31mDeclared uncompressed size does not check out\033[0m")
+                if output is not None:
+                    output.write(decompressed_bytes)
             except zlib.error as e:
                 print(f"  \033[31mzlib decompression failed! {e}\033[0m")
+        elif output is not None:
+            output.write(file.read(block_size))
 
         offset += ZLIB_BLOCK_HEADER_SIZE + block_size
         block_i += 1

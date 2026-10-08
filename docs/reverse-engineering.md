@@ -408,6 +408,8 @@ So, we cannot use most of the footer's data to decode the rest of the binary sav
 
 All the data-loading functions that we studied earlier rely on `CReader::ReadDataFromFile` to get their bytes before interpreting them. In particular, if enabled it decompresses the payload block by block using zlib. This processing step is independent of any later cutting and interpretation of the bytes, so we can try to work it out first.
 
+##### Looking for zlib blocks
+
 Let's assume that zlib compression is indeed enabled in KCD, and look at what `CReader::ReadDataFromZLibBuffer` does in that case. At lines 173-174, we can see that it expects to find a header structure (`SZLibBlockHeader`, defined in `XMLCPB_Common.h` at lines 90-95) at the start of a compressed block:
 ```cpp
 SZLibBlockHeader blockHeader;
@@ -523,3 +525,93 @@ If we run this script on our sample saves, it finds no errors at all. We now hav
 *Note: inspecting each zlib block shows that all of them start with those 2 bytes: `78 5E` (if compressed). It is a strong marker of zlib, as it is a header that tells the compression mode ([see Wikipedia's List of file signatures](https://en.wikipedia.org/wiki/List_of_file_signatures), and [RFC 1950 section 2.2 "Data format"](https://www.rfc-editor.org/info/rfc1950/#section-2)).*
 
 A refined, ready-to-use version of the script above is available in [`read_zlib_blocks.py`](read_zlib_blocks.py).
+
+##### Decoding the decompressed payload
+
+Now that we know that KCD save files are a sequence of compressed zlib blocks (except for the footer), the natural thing to do is to decompress the whole payload and to analyze it.
+
+For brevity we will not go into detail on the Python implementation, but the [`read_zlib_blocks.py`](read_zlib_blocks.py) script has a `--decompress` option that will create a new file next to the input save file, named after it with a `.decompressed.bin` extension, and containing all decompressed bytes, without the file footer.
+
+Let's take for example this dump of the first 142 bytes of a decompressed save payload (wrapped to 32 bytes per line):
+```hex
+14 00 00 00 F5 01 4E 01 00 00 0D 00 3E 01 00 00 00 00 00 00 01 00 00 00 10 64 70 67 00 00 00 00 
+72 61 74 61 6A 65 00 30 7C 31 7C 40 73 75 62 63 68 61 70 74 65 72 5F 32 39 38 5F 6E 61 6D 65 7C 
+40 6F 62 6A 65 63 74 69 76 65 5F 53 61 76 65 6E 61 6D 65 5F 31 7C 40 6C 6F 63 61 74 69 6F 6E 5F 
+53 6B 61 6C 69 63 65 7C 31 37 33 35 34 31 38 38 39 36 7C 32 38 2F 31 32 2F 32 30 32 34 20 32 31 
+3A 34 38 7C 30 2E 30 35 36 38 38 32 7C 00
+```
+
+Inspecting this decompressed payload in a hexadecimal viewer immediately shows a lot of readable strings (decoded as ANSI characters). For example, this sequence of 110 bytes starting at offset 32:
+```
+rataje�0|1|@subchapter_298_name|@objective_Savename_1|@location_Skalice|1735418896|28/12/2024 21:48|0.056882|�
+```
+
+Let's break it down:
+- "rataje" is the Czech name for Rattay.
+- "0" and "1" look like booleans.
+- "@subchapter_298_name", "@objective_Savename_1" and "@location_Skalice" look like localized string IDs.
+- "28/12/2024 21:48" is definitely a date.
+- 1735418896 is a big integer that could be a timestamp. A quick check confirms that it is a UNIX timestamp of the date above.
+- "0.056882" is a decimal number (represented as a string!).
+- The pipe separators "|" hint at a string-encoded data structure.
+
+We are definitely on track!
+
+Previously we saw that CryEngine expects the first "section" of the payload to be the "nodes buffer". But it does not parse the data on its own just yet. It does that after loading all data, in `CReader::CreateNodeAddressTables` (line 437). Inside, the most interesting part is the construction of a `CNodeLiveReader` object, and the call to its method `ActivateFromCompact`.
+
+In `Code/CryEngine/CryAction/Serialization/XMLCPBin/Reader/XMLCPB_NodeLiveReader.cpp` at line 190 we can see that the code expects once again a header for each node. Here, it is the first 2 bytes, decoded as a `uint16`. The next lines suggest that this header is actually holding multiple flags that can be read with bit masking. Looking up those bit masks brings us back to `XMLCPB_Common.h`, at lines 177-225. There, a comment suggests that `CNodeLiveWriter::Compact` has an understandable description of the format of those nodes.
+
+`CNodeLiveWriter::Compact` can be found at lines 267-450 in `Code/CryEngine/CryAction/Serialization/XMLCPBin/Writer/XMLCPB_NodeLiveWriter.cpp`, and the aforementioned comment is right above.
+
+It says for the header:
+```
+2 bytes  -> header, split into:
+    15 -> 1 = has attrs
+    14 -> 1 = children are right before
+    13 ->    -| 0-2 number of children. 3 = more than 2 children
+    12 ->    -|
+    11 ->  -|
+    10 ->  -| 2 bits high for the attrSet id
+    -> 10 bits  (9-0)  -> Tag ID
+```
+
+It means that the bit of weight 2^15 (that we will call bit15 from now on) is a boolean flag for "has attributes". Bit14 is a flag for "its children are right before". Bit13 and bit12 hold a number: it is the number of children, capped to 3. The next 2 lines – and it is really confusing – actually describe a different bit span: bit11 and bit10 hold the 2 most significant bits of the "attribute set ID". And the last 10 bits, bit9 to bit0, hold the "tag ID".
+
+In our example we find bytes `14 00` at offset 0. They decode as `0x0014` (little-endian):
+```
+00000000 00010100
+```
+
+This would decode as:
+- the node does not have attributes;
+- its children are NOT before it;
+- it has 0 children;
+- 00 are the two most significant bits of its attribute set ID (which tells us nothing as-is);
+- its tag ID is 20.
+
+This is entirely possible. We cannot conclude from that header alone.
+
+The same comment describes a couple of other byte spans, which are absent when the node has no children nor attributes, and in the end says:
+```
+[...]  -> attr data
+```
+
+What is that attribute data? It is compacted at lines 428-431 in `XMLCPB_NodeLiveWriter.cpp`:
+```cpp
+for (int a = 0; a < m_attrs.size(); ++a)
+{
+    m_attrs[a].Compact();
+}
+```
+
+A simple loop over all attributes of the node, calling `Compact` on each one. The implementation of `CAttrWriter::Compact` is in `Code/CryEngine/CryAction/Serialization/XMLCPBin/Writer/XMLCPB_AttrWriter.cpp` at lines 396-540.
+
+The code teaches us that "string" attributes (`case DT_STR` line 414) are not actually stored in compacted nodes. Only the string ID is encoded. There is an exception for strings longer than 1024 characters (see `CAttrWriter::Set` at lines 70-75) which are stored as raw data (`case DT_RAWDATA` line 528): the bytes are stored inline, prefixed by a `uint32` holding the size of the span. It means that our "nodes buffer" should rarely contain text, and if so, it should be encoded as raw data.
+
+Yet, the readable string mentioned earlier (`rataje�0|1|@subchapter_298_name|...`) was found only 32 bytes into the payload. The longest run of readable characters is `0|1|@subchapter_298_name|@objective_Savename_1|@location_Skalice|1735418896|28/12/2024 21:48|0.056882|`, so only 102 characters, and the four preceding bytes (as `uint32`) do not decode as a valid size for this string either. We could also consider that the string starts at `rataje` instead, but the 4 preceding bytes decode as 0, which is also not the size of the string. This seems contradictory with it being part of the nodes buffer.
+
+This string is long and meaningful, so we can also drop the hypothesis that those bytes decode to readable text by chance.
+
+Finally, if we consider the case where this text is contained in a larger raw data attribute, we should find a node header declaring that it has attributes. As we saw earlier, it would mean that we should find a span of 2 bytes whose most significant bit is 1 in little-endian order. Said differently, we should find a 2-byte span ranging from `?? 80` to `?? FF`, where `?` can be any hex digit. In our example, the only byte that is between `80` and `FF` that we could find before the string starts is `F5`, at offset 4. For `F5` to be the most significant byte of the node header, it would mean that the header starts with `00 F5`, at offset 3. This leaves only 3 bytes before it. In our example the first 2 bytes are `14 00`, meaning that this first node has no children and no attributes. Therefore the first node stops at 2 bytes. This leaves only 1 byte before offset 3, and as we said, a node header takes at least 2 bytes, so this is a contradiction. We can conclude that the text we see cannot be part of a node attribute.
+
+If this text is not part of the nodes buffer, it means that the nodes buffer takes at most 32 bytes in our example. Since each node takes at least 2 bytes, we have room for at most 16 nodes. This is highly unlikely.
