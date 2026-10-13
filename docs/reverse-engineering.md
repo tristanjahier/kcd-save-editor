@@ -557,6 +557,8 @@ Let's break it down:
 
 We are definitely on track!
 
+###### Trying to match CryEngine's save reading logic
+
 Previously we saw that CryEngine expects the first "section" of the payload to be the "nodes buffer". But it does not parse the data on its own just yet. It does that after loading all data, in `CReader::CreateNodeAddressTables` (line 437). Inside, the most interesting part is the construction of a `CNodeLiveReader` object, and the call to its method `ActivateFromCompact`.
 
 In `Code/CryEngine/CryAction/Serialization/XMLCPBin/Reader/XMLCPB_NodeLiveReader.cpp` at line 190 we can see that the code expects once again a header for each node. Here, it is the first 2 bytes, decoded as a `uint16`. The next lines suggest that this header is actually holding multiple flags that can be read with bit masking. Looking up those bit masks brings us back to `XMLCPB_Common.h`, at lines 177-225. There, a comment suggests that `CNodeLiveWriter::Compact` has an understandable description of the format of those nodes.
@@ -615,3 +617,302 @@ This string is long and meaningful, so we can also drop the hypothesis that thos
 Finally, if we consider the case where this text is contained in a larger raw data attribute, we should find a node header declaring that it has attributes. As we saw earlier, it would mean that we should find a span of 2 bytes whose most significant bit is 1 in little-endian order. Said differently, we should find a 2-byte span ranging from `?? 80` to `?? FF`, where `?` can be any hex digit. In our example, the only byte that is between `80` and `FF` that we could find before the string starts is `F5`, at offset 4. For `F5` to be the most significant byte of the node header, it would mean that the header starts with `00 F5`, at offset 3. This leaves only 3 bytes before it. In our example the first 2 bytes are `14 00`, meaning that this first node has no children and no attributes. Therefore the first node stops at 2 bytes. This leaves only 1 byte before offset 3, and as we said, a node header takes at least 2 bytes, so this is a contradiction. We can conclude that the text we see cannot be part of a node attribute.
 
 If this text is not part of the nodes buffer, it means that the nodes buffer takes at most 32 bytes in our example. Since each node takes at least 2 bytes, we have room for at most 16 nodes. This is highly unlikely.
+
+So... again, a dead end. It strongly suggests that Kingdom Come: Deliverance only uses the envelope of CryEngine's XMLCPB save format (the 64-byte footer and the zlib blocks).
+
+###### Tinkering with the hexadecimal viewer
+
+For reference, we will work on the same example as before, but extended to the first 192 bytes (offsets are decimal!):
+```
+    | 00 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+----+------------------------------------------------------------------------------------------------
+ 00 | 14 00 00 00 F5 01 4E 01 00 00 0D 00 3E 01 00 00 00 00 00 00 01 00 00 00 10 64 70 67 00 00 00 00 
+ 32 | 72 61 74 61 6A 65 00 30 7C 31 7C 40 73 75 62 63 68 61 70 74 65 72 5F 32 39 38 5F 6E 61 6D 65 7C 
+ 64 | 40 6F 62 6A 65 63 74 69 76 65 5F 53 61 76 65 6E 61 6D 65 5F 31 7C 40 6C 6F 63 61 74 69 6F 6E 5F 
+ 96 | 53 6B 61 6C 69 63 65 7C 31 37 33 35 34 31 38 38 39 36 7C 32 38 2F 31 32 2F 32 30 32 34 20 32 31 
+128 | 3A 34 38 7C 30 2E 30 35 36 38 38 32 7C 00 40 73 75 62 63 68 61 70 74 65 72 5F 32 39 38 5F 6E 61
+160 | 6D 65 7C 40 6F 62 6A 65 63 74 69 76 65 5F 53 61 76 65 6E 61 6D 65 5F 31 00 C8 00 00 00 C8 00 00
+```
+
+Here is some context about the save that our example payload is extracted from. Context is super important because for a savegame, we should probably find traces of the save timestamp, the in-game location, how many hours have been played etc.
+
+- saved on 2024-12-28 at 21:48 (Europe/Paris);
+- language setting: French;
+- total playtime: a couple of minutes (it is the first automatic save of the game after the intro);
+- location is Skalitz (English), or Skalice (French, Czech);
+- in-game time: day 1, 10am.
+
+At this point we don't have many clues except that some readable text starts at offset 32 (line 2). However, there are a few rules to consider:
+
+- Integers are usually stored on 1, 2, 4 or 8 bytes, respectively as `int8`/`uint8`, `int16`/`uint16`, `int32`/`uint32` and `int64`/`uint64`.
+- Numeric IDs and counters tend to be rather small numbers. As humans, we rarely manipulate huge numbers, for example 4,294,967,295 which is the largest value a `uint32` can hold. This is definitely not a hard rule though.
+- Byte offsets, sizes and timestamps are exceptions to the previous point. Our example decompressed payload is 25+ MiB long; its last offset is 26,715,956. A contemporary timestamp is greater than 1,700,000,000 seconds, or 1,700,000,000,000 milliseconds (which does not fit in 32 bits).
+- A consequence of numbers tending to be rather small is that the most significant bytes of **positive** integers are often `00`. In little-endian, which is the convention we've seen everywhere so far, it means that their last bytes are zeros. For example, `26 1C 00 00` as a `uint32` is 7206. For **negative** integers, which are represented as signed integers with [two's complement](https://en.wikipedia.org/wiki/Two%27s_complement), they tend to be `FF`. For example, `EC F6 FF FF` as an `int32` is -2324.
+- Strings are usually a variable-length chain of bytes ending with a `NUL` character (`00`).
+- When data structures are plain copies of C or C++ objects they can include padding, as we saw in the first part of this guide.
+
+We can try selecting arbitrary byte spans and look at what they decode to. We can start cutting everything into 4-byte spans:
+
+| Offset (dec) | Bytes         | Observations                             |
+| -----------: | ------------- | :--------------------------------------- |
+|            0 | `14 00 00 00` | Looks like a small positive integer: 20. |
+|            4 | `F5 01 4E 01` | Could be 21,889,525. |
+|            8 | `00 00 0D 00` | Could be 851,968. |
+|           12 | `3E 01 00 00` | Looks like a small positive integer: 318. |
+|           16 | `00 00 00 00` | Could be 0. Could be padding. |
+|           20 | `01 00 00 00` | Could be 1. Or could be a boolean on one byte. The zeros could also be padding. |
+|           24 | `10 64 70 67` | Could be 1,735,418,896. It is a huge number, but it does look a lot like a contemporary timestamp in seconds. |
+|           28 | `00 00 00 00` | Could be 0. Could be padding. |
+|           32 | `72 61 74 61` | Decodes to "rata", which are the first 4 characters of "rataje". |
+
+Offset 32 is the start of 3 NUL-terminated coherent strings: `"rataje"`, `"0|1|@subchapter_298_name|@objective_Savename_1|@location_Skalice|1735418896|28/12/2024 21:48|0.056882|"` and `"@subchapter_298_name|@objective_Savename_1"`. As we already said earlier, these strings are meaningful, they are readable and make a lot of sense in the game context and in general. Therefore, we can say for sure that span [32-184] is a sequence of 3 strings.
+
+Let's then focus on the bytes before.
+
+The small integers look like good interpretations but... that's all. Nothing to conclude yet.
+
+The most interesting one is the timestamp at [24-27]. It decodes to `1735418896` or `2024-12-28 20:48:16`. Well well well... this is literally the date at which the reference save was created, in UTC. The timestamp also appears in the following text, and the date too, as "28/12/2024 21:48", which is the local time.
+
+Now let's cut the payload into 2-byte spans instead, stopping at the timestamp we just pinned down:
+
+| Offset (dec) | Bytes   | Observations                             |
+| -----------: | ------- | :--------------------------------------- |
+|            0 | `14 00` | 20                                       |
+|            2 | `00 00` | 0. Padding?                              |
+|            4 | `F5 01` | 501                                      |
+|            6 | `4E 01` | 334                                      |
+|            8 | `00 00` | 0. Padding?                              |
+|           10 | `0D 00` | 13                                       |
+|           12 | `3E 01` | 318                                      |
+|           14 | `00 00` | 0. Padding?                              |
+|           16 | `00 00` | 0. Padding?                              |
+|           18 | `00 00` | 0. Padding?                              |
+|           20 | `01 00` | 1                                        |
+|           22 | `00 00` | 0. Padding?                              |
+
+However, nothing guarantees that the cutting must be regular. It makes exhaustive exploration complex (for a human at least). Fortunately, we don't have that many bytes to sort because we know that at offset 24 we have a timestamp, therefore we must find a layout that looks fitting, and that stops exactly where the timestamp starts.
+
+Remembering the rules we listed before, two zero bytes in a row are often the sign of a small integer on 4 bytes. If we mix this with the objective of prioritizing small integers, we could then organize the first 24 bytes like that:
+
+| Offset (dec) | Bytes         | Observations                             |
+| -----------: | ------------- | :--------------------------------------- |
+|            0 | `14 00 00 00` | 20                                       |
+|            4 | `F5 01`       | 501                                      |
+|            6 | `4E 01 00 00` | 334                                      |
+|           10 | `0D 00`       | 13                                       |
+|           12 | `3E 01 00 00` | 318                                      |
+|           16 | `00 00 00 00` | 0                                        |
+|           20 | `01 00 00 00` | 1                                        |
+
+That might be overfitting, but what could those numbers mean?
+
+They could be IDs, they could be offsets, they could be sizes but they could also just be game counters. Given the size of the payload, `uint16` values are less likely to be offsets, because they could not point too far in the file (max value of a `uint16` is 65,535).
+
+Here follow a few tests. "Offset" here means specifically "absolute offset, relative to the start". "size" will be tested as "a span of N bytes starting immediately after the size declaration".
+
+| What is tested?  | Observations |
+| ---------------- | ------------ |
+| 20 as an offset  | Offset 20 is our "1" value. Nothing to conclude. |
+| 20 as a size     | Lands on the timestamp at offset 24. It looks fitting. |
+| 501 as a size    | Lands in the middle of a string: `"burnt_farms_01_rataje_north_burnt"`, impossible because a string is one coherent structure. |
+| 334 as an offset | Lands right after a string. Plausible. |
+| 334 as a size    | Lands on offset 344. Possible. Nothing stands out at first glance. |
+| 13 as a size     | Lands in the middle of the timestamp at offset 25. Invalid. |
+| 318 as an offset | Lands in the middle of a string: `"Le lot des femmes"`. Invalid.
+| 318 as a size    | Lands right after a string. Plausible. |
+
+20 (`14 00 00 00`, offset 0) could be a header's size. And the next 20 bytes would be the header's contents. That fits with the beginning of the timestamp.
+
+We can rule out the two `uint16` (501 and 13) as sizes, as they cover no coherent span.
+
+What about 334 and 318?
+
+If both are sizes, then they cannot describe two different and consecutive spans, as the 318-byte span would be entirely contained within the 334-byte span. Instead, this would be possible if they describe nested structures. However there would then be a 10-byte gap to explain after the 318-byte span and before the end of the 334-byte span:
+```
+10 00 04 00 00 00 01 00 00 00
+```
+
+We shall naively try to apply the same pattern, which fits in size:
+```
+10 00  | 04 00 00 00 | 01 00 00 00
+uint16 |    uint32   |     ???
+```
+
+`10 00` decodes to 16. `04 00 00 00` decodes to 4. And there are exactly 4 bytes left before the end of the 334-byte span, which fits the "size" meaning.
+
+Note that this is incompatible with two other hypotheses: "20 is the size of a header" and "334 is an offset". But this potential pattern looks more promising, because it repeats and leads us further.
+
+At this point, testing by hand in a basic hexadecimal viewer can start to feel cumbersome. Fortunately, a lot of tools exist to ease the work of reverse engineers.
+
+[ImHex](https://github.com/WerWolv/ImHex) is one of them. It allows us to declare patterns with [its domain-specific language](https://docs.werwolv.net/pattern-language), and see them matched in real-time in its hexadecimal viewer.
+
+Here is an ImHex pattern that matches the structure that we may have uncovered:
+```hexpat
+import std.mem;
+
+struct UndeterminedPattern {
+    u16 thing;
+    u32 size;
+    std::mem::Bytes<size> content;
+};
+
+UndeterminedPattern my_pattern[while($ + 6 <= std::mem::size())] @ 0x04;
+```
+
+`u16 thing` is our undetermined `uint16`. `u32 size` is the following `uint32` that we identified as "size". `std::mem::Bytes<size> content` covers the undetermined content that comes after. The last line declares that the pattern starts at offset 4 (`@ 0x04`), and that it shall be repeated while the current offset has not exceeded the 6th-to-last byte of the payload. Note that this script does not cover nested structures.
+
+**Running this pattern with ImHex on the decompressed payload shows that it repeats 3 times and the last match finishes exactly one byte before the end.** And the trailing byte is `FF`.
+
+It seems to fit, but the best way to confirm that we have actually found a real pattern is to test it on other save files.
+
+| Save Name                | Pattern Matches                                                                           | Leading Bytes | Trailing Bytes | 
+| ------------------------ | ----------------------------------------------------------------------------------------- | ------------- | :------------: |
+| permanent001 (reference) | 3 matches. (thing: 501; size: 334), (thing: 500; size: 26,715,600), (thing: 509; size: 0) | `14 00 00 00` | `FF`           |
+| permanent004             | 3 matches. (thing: 501; size: 334), (thing: 500; size: 26,645,788), (thing: 509; size: 0) | `14 00 00 00` | `C8`           |
+| permanent011             | 3 matches. (thing: 501; size: 333), (thing: 500; size: 26,218,464), (thing: 509; size: 0) | `14 00 00 00` | `00`           |
+| permanent013             | 3 matches. (thing: 501; size: 347), (thing: 500; size: 26,321,604), (thing: 509; size: 0) | `14 00 00 00` | `00`           |
+| save508                  | 3 matches. (thing: 501; size: 273), (thing: 500; size: 31,734,077), (thing: 509; size: 0) | `14 00 00 00` | `00`           |
+| save669                  | 3 matches. (thing: 501; size: 281), (thing: 500; size: 31,838,512), (thing: 509; size: 0) | `14 00 00 00` | `BE`           |
+| switch51141              | 3 matches. (thing: 501; size: 281), (thing: 500; size: 31,638,195), (thing: 509; size: 0) | `14 00 00 00` | `00`           |
+
+Those results are rich! Here are the takeaways:
+
+1. The tested pattern works on 7 save files of 3 different types (what those types are is still unknown).
+2. There are always 3 consecutive spans starting exactly at offset 4 and finishing at the second-to-last offset.
+3. The "things" never change, at a given position.
+4. The sizes are always of the same magnitude, at a given position.
+5. The last match's size is always zero.
+6. The four leading bytes are always the same.
+7. The trailing byte seems not to follow any obvious pattern.
+
+With all this evidence we can say confidently that we actually found a real pattern in the binary layout.
+
+The fact that "things" are stable makes one think that it is a kind of identifier for the span.
+
+The thing-509 span could be an unused item, or a marker for the end of the payload.
+
+Now we need to test whether this pattern nests or not. The first instance we spotted (thing: 501; size: 334) at offset 4 seemed to have two similar consecutive child patterns: (thing: 13; size: 318) and (thing: 16; size: 4).
+
+```hexpat
+import std.mem;
+
+fn pattern_fits(u128 offset, u128 limit) {
+    if (offset + 6 > limit)
+        return false;
+        
+    u32 size = std::mem::read_unsigned(offset + 2, 4);
+    return offset + 6 + size <= limit;
+};
+  
+struct UndeterminedPattern {
+    u16 thing;
+    u32 size;
+    UndeterminedPattern children[while(pattern_fits($, addressof(this) + 6 + size))];
+    
+    if ($ < addressof(this) + 6 + size) {
+        std::mem::Bytes<addressof(this) + 6 + size - $> rest;
+    }
+};
+
+UndeterminedPattern my_pattern[while($ + 6 <= std::mem::size())] @ 0x04;
+```
+
+There are three changes:
+
+1. `UndeterminedPattern children[while(pattern_fits($, addressof(this) + 6 + size))];` replaces the former `content`. It introduces pattern recursion. Children are parsed as long as `pattern_fits` returns `true`.
+2. function `pattern_fits` checks that a candidate child pattern would fit within its parent's limits.
+3. `rest` covers the remainder that could not be parsed as children.
+
+If we run that modified script on the decompressed payload with ImHex again, it shows that the pattern is indeed recursive. The parsed tree is immense.
+
+- The first root span, (thing: 501; size: 334), has only two direct descendants: the two that we already identified: (thing: 13; size: 318) and (thing: 16; size: 4).
+- The second root span, (thing: 500; size: 26,715,600), has 3 children: (thing: 507; size: 32,812), (thing: 503; size: 7,415,945) and (thing: 502; size: 19,266,825). They have many descendants of their own, which we won't detail.
+- The third root span, (thing: 509; size: 0), has no children, which is normal because it has a size of zero.
+
+All non-empty spans in the first 3 levels of the tree have either children or a "rest" (remainder bytes) but not both, which means that children add up exactly to their parent's size. That is a good sign because it means that the apparent nesting was not a stroke of luck. Take the second root span for example, which announces a size of 26,715,600 bytes: its 3 children announce sizes of 32,812, 7,415,945 and 19,266,825 respectively. With the 6 bytes of each header, they add up exactly to their parent's size: (6 + 32,812) + (6 + 7,415,945) + (6 + 19,266,825) = 26,715,600. That is highly unlikely by chance.
+
+Deeper in the tree (under the second root span), some spans have both children and a rest. Most of them are parents of (thing: 0; size: 0). For example, at offset 0x72BC11 (7519249), span (thing: 778; size: 96) has one child (thing: 0; size: 0), and 90 more bytes as "rest". The remaining cases are parents of (thing: N>0; size: 0).
+
+Given that zero bytes are very common in a binary payload (zero values, high bytes of very small integers, padding), those empty spans (2 bytes of whatever plus 4 zero bytes) are likely accidental matches.
+
+Now we must test that on multiple other saves as well:
+
+| Save Name                | Results                                                                                   |
+| ------------------------ | ----------------------------------------------------------------------------------------- |
+| permanent001 (reference) | Described above. 6,051 spans with both children and rest, mostly (thing: 778).            |
+| permanent004             | Nesting pattern holds. Children of 2nd root span fit its size exactly: 3x6 + 32,812 + 7,444,102 + 19,168,856 = 26,645,788. 6,043 spans with both children and rest, mostly (thing: 778). |
+| permanent011             | Nesting pattern holds. Children of 2nd root span fit its size exactly: 3x6 + 32,812 + 6,890,077 + 19,295,557 = 26,218,464. 5,753 spans with both children and rest, mostly (thing: 778). |
+| permanent013             | Nesting pattern holds. Children of 2nd root span fit its size exactly: 3x6 + 32,812 + 6,855,885 + 19,432,889 = 26,321,604. 5,765 spans with both children and rest, mostly (thing: 778). |
+| save508                  | Nesting pattern holds. Children of 2nd root span fit its size exactly: 3x6 + 32,812 + 8,298,184 + 23,403,063 = 31,734,077. 5,761 spans with both children and rest, mostly (thing: 778). |
+| save669                  | Nesting pattern holds. Children of 2nd root span fit its size exactly: 3x6 + 32,812 + 8,217,480 + 23,588,202 = 31,838,512. 5,928 spans with both children and rest, mostly (thing: 778). |
+| switch51141              | Nesting pattern holds. Children of 2nd root span fit its size exactly: 3x6 + 32,812 + 8,183,235 + 23,422,130 = 31,638,195. 5,920 spans with both children and rest, mostly (thing: 778). |
+
+Note: numbers concerning spans with both children and rest can be retrieved using [jq](https://jqlang.org/) on an export of ImHex results in JSON:
+```sh
+imhex --pl format -i mysave.decompressed.bin -p pattern.hexpat -f json -o mysave.decompressed.json
+jq '[.. | objects | select((.children | length) > 0 and has("rest"))] | length' mysave.decompressed.json
+jq '[.. | objects | select((.children | length) > 0 and has("rest")) | .thing] | group_by(.) | map({thing: .[0], count: length}) | sort_by(-.count) | .[]' mysave.decompressed.json
+```
+
+We can conclude confidently that this pattern is actually nested, and covers the vast majority of the payload, even though we still need to explain those empty spans and those that have both children and rest.
+
+Another interesting result is that the "thing" field is not unique: its value can be shared by multiple spans, even as siblings. Here is a jq query to group spans by thing and count (only when >1):
+```sh
+jq '[.. | objects | select(has("thing")) | .thing] | group_by(.) | map({thing: .[0], count: length}) | map(select(.count > 1)) | sort_by(-.count) | .[]' mysave.decompressed.json
+```
+
+If the "thing" field looks like an identifier but is not unique, then it is more like a class, a category or a type.
+
+**The structure we uncovered is actually a well-known one: [Type-Length-Value](https://en.wikipedia.org/wiki/Type%E2%80%93length%E2%80%93value) (or Tag-Length-Value).** Generic data container formats like [IFF](https://en.wikipedia.org/wiki/Interchange_File_Format) and [RIFF](https://en.wikipedia.org/wiki/Resource_Interchange_File_Format) use this structure too. Those two formats call the byte spans "chunks", and they can be nested.
+
+_From now on, for consistency, we will then call the spans matching this pattern "chunks", their class "type", and their size "length"._
+
+Here is the updated ImHex pattern:
+```hexpat
+import std.mem;
+
+fn chunk_fits(u128 offset, u128 limit) {
+    if (offset + 6 > limit)
+        return false;
+        
+    u32 length = std::mem::read_unsigned(offset + 2, 4);
+    return offset + 6 + length <= limit;
+};
+  
+struct Chunk {
+    u16 type;
+    u32 length;
+    Chunk children[while(chunk_fits($, addressof(this) + 6 + length))];
+    
+    if ($ < addressof(this) + 6 + length) {
+        std::mem::Bytes<addressof(this) + 6 + length - $> rest;
+    }
+};
+
+Chunk my_pattern[while($ + 6 <= std::mem::size())] @ 0x04;
+```
+
+A refined, ready-to-use Python script that parses the chunk tree from a decompressed payload is available in [`read_decompressed_payload.py`](read_decompressed_payload.py).
+
+And here is the binary layout of the decompressed payload as we understand it so far:
+```
+# legend (in addition to the footer's grammar):
+# .<label> as a byte span size references the <label> field in the same type, which must come earlier and be an unsigned integer.
+
+chunk :=
+    [      2 | typeId: unsigned integer]
+    [      4 | length: unsigned integer]
+    [.length | value: chunk{1..*} or bytes]
+
+payload :=
+    [4 | undetermined1: unsigned integer]  # the 4 leading bytes
+    [? | chunks: chunk{3}]  # the 3 root chunks that we found every time
+    [1 | undetermined2: bytes]  # the trailing byte
+```
+
+What remains to be figured out:
+
+- whether type 0 and/or length 0 are valid chunks;
+- how to read chunk values when they are not nested chunks;
+- whether child chunks can cohabit with other data, and whether those children must come first or not;
+- what `undetermined1` and `undetermined2` are for.
