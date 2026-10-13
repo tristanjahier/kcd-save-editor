@@ -4,7 +4,7 @@ This guide was written using a sample of over a dozen actual save files made on 
 
 Saved games are `.whs` files located at `%USERPROFILE%\Saved Games\kingdomcome\saves\playline<N>`.
 
-## The game engine
+## 1. Inspecting the game engine source code
 
 Our first lead is the game engine. Game engines may offer tools to serialize the state of the game world, and in the case of an open-world game like Kingdom Come: Deliverance, it could be useful to save the state of hundreds of NPCs (their locations, statistics and inventories), the contents of chests, the progress of quests and objectives, the items dropped on the ground, etc.
 
@@ -12,7 +12,7 @@ It is publicly known that Kingdom Come: Deliverance was built on CryEngine. The 
 
 CryEngine 3 is a proprietary engine, its code is not public, and in 2026 it is hard to find any resources for that version anyway. CryEngine was open-sourced ("source-available" to be accurate) as of version 5, though, and it is possible that the game serialization/save code did not change. The source code of CryEngine 5 used to be public on GitHub, but as of 2026 the repository is no longer freely accessible. Instead, [you need to create a cryengine.com account and a GitHub account, then request access to the source code](https://github.com/CRYTEK/CRYENGINE_ReadMe).
 
-### Inspecting its source code
+---
 
 From now on, we will consider that we have been granted access to the source code of CryEngine 5 on GitHub. The reference version is 5.7.1 (the only one Crytek still distributes as of October 2026).
 
@@ -57,7 +57,7 @@ After this cat-and-mouse game, we can finally read the implementation of `ReadBy
 
 Since `data` points to `fileHeader`, we can conclude that, unless the save file is encrypted, the footer is just a plain memory copy of the struct `SFileHeader`.
 
-#### Decoding the SFileHeader structure
+### 1.1. Decoding the SFileHeader structure
 
 `SFileHeader` is defined at `Code/CryEngine/CryAction/Serialization/XMLCPBin/XMLCPB_Common.h:53`. We need to compute `sizeof(SFileHeader)` so that we can find the position where the footer starts, in order to examine those bytes in a hexadecimal editor.
 
@@ -320,7 +320,7 @@ footer :=
 A refined, ready-to-use version of the script above is available in [`read_footer.py`](read_footer.py).
 
 
-#### Decoding the rest of the save loading logic
+### 1.2. Unraveling the rest of the save loading logic
 
 Now back to the `CReader::ReadBinaryFile` function in `Code/CryEngine/CryAction/Serialization/XMLCPBin/Reader/XMLCPB_Reader.cpp`.
 
@@ -339,7 +339,7 @@ At line 253 it moves the cursor to the beginning of the file again.
 
 Then, at lines 255-259, it verifies that the `m_fileTypeCheck` member of the decoded `SFileHeader` is equal to its default value, `'PBX0'`, otherwise it aborts reading. It confirms that `'PBX0'` is an identity marker of the footer, and that we MUST find it every time.
 
-##### The "nodes buffer"
+#### 1.2.1. The "node buffer"
 
 Continuing forward, lines 263-265 fill a buffer via the "buffer reader" (`SBufferReader m_buffer`):
 ```cpp
@@ -358,7 +358,7 @@ Note: `g_XMLCPBUseExtraZLibCompression` is enabled by default, as seen in `Code/
 
 In the end, the raw or decompressed data is stored in `SBufferReader::m_pBuffer`. This buffer holds something called "nodes", even though we don't know what it is yet.
 
-##### The "string tables"
+#### 1.2.2. The "string tables"
 
 Immediately after, lines 266-268 read the 3 "string tables" mentioned in `SFileHeader`, of type `CStringTableReader`.
 ```cpp
@@ -375,7 +375,7 @@ m_tableStrData.ReadFromFile(*this, pOSSaveReader, fileHeader.m_strData);
 
 The same applies for `m_tableAttrNames` and `m_tableStrData`.
 
-##### The "attribute sets table"
+#### 1.2.3. The "attribute set table"
 
 Next, line 269 reads the "table of attribute sets":
 ```cpp
@@ -387,7 +387,7 @@ m_tableAttrSets.ReadFromFile(*this, pOSSaveReader, fileHeader);
 2. It gets its `m_setAddrs` by reading the next `sizeof(FlatAddr16) * m_numAttrSets` bytes through `CReader::ReadDataFromFile`. It is a table of the addresses of attribute sets (source: method `GetHeaderAttr`, lines 32-41 in `XMLCPB_AttrSetTableReader.cpp`).
 3. It uses its buffer reader (`SBufferReader`) to read the next `m_sizeAttrSets` bytes which are the "attribute sets" data.
 
-##### The "node addresses table"
+#### 1.2.4. The "node address table"
 
 Next, line 270:
 ```cpp
@@ -398,17 +398,15 @@ This method parses each node from `CReader`'s buffer using `CNodeLiveReader` jus
 
 Finally, `CReader::ReadBinaryFile` "activates" the root node (we do not know what it means, and that is probably unimportant at that step), and "touches" the file to mark it as the most recent loaded savegame (could be used for the "Continue" button in the main menu).
 
-##### Conclusion
+#### 1.2.5. Conclusion
 
 All the data-loading steps described above depend on fields (`m_sizeNodes`, `m_numNodes`, `m_numAttrSets`, `m_sizeAttrSets` etc.) that are all zeros in the save files of our sample. It would mean that, according to CryEngine's savegame loading code, those save files should be empty apart from their 64-byte footer, which is obviously untrue because they typically weigh more than 5 MiB and they are recognized by the game. So it looks like KCD does not strictly comply with CryEngine's XMLCPB save format, or maybe just not this one from version 5.7.
 
-#### Decoding the rest of the binary
+### 1.3. Too much for zlib blocks 🐇
 
 So, we cannot use most of the footer's data to decode the rest of the binary save file... which is annoying. Yet the presence of the footer in all tested KCD saves hints that we are on the right track.
 
 All the data-loading functions that we studied earlier rely on `CReader::ReadDataFromFile` to get their bytes before interpreting them. In particular, if enabled it decompresses the payload block by block using zlib. This processing step is independent of any later cutting and interpretation of the bytes, so we can try to work it out first.
-
-##### Looking for zlib blocks
 
 Let's assume that zlib compression is indeed enabled in KCD, and look at what `CReader::ReadDataFromZLibBuffer` does in that case. At lines 173-174, we can see that it expects to find a header structure (`SZLibBlockHeader`, defined in `XMLCPB_Common.h` at lines 90-95) at the start of a compressed block:
 ```cpp
@@ -416,7 +414,7 @@ SZLibBlockHeader blockHeader;
 ReadDataFromFileInternal(pOSSaveReader, &blockHeader, sizeof(blockHeader));
 ```
 
-Using the same rules that we detailed in the first part of this guide, we can compute that `SZLibBlockHeader` takes 8 bytes in memory (2 x uint32, alignment of 4). If KCD saves are compressed like CryEngine does, we should find `m_compressedSize` at offset 0 and `m_uncompressedSize` at offset 4.
+Using the same rules that we detailed in §1.1, we can compute that `SZLibBlockHeader` takes 8 bytes in memory (2 x uint32, alignment of 4). If KCD saves are compressed like CryEngine does, we should find `m_compressedSize` at offset 0 and `m_uncompressedSize` at offset 4.
 
 In an example save:
 - `m_compressedSize`: `D0 20 00 00`, which translates as `8400` in uint32 little-endian.
@@ -526,24 +524,27 @@ If we run this script on our sample saves, it finds no errors at all. We now hav
 
 A refined, ready-to-use version of the script above is available in [`read_zlib_blocks.py`](read_zlib_blocks.py).
 
-##### Decoding the decompressed payload
+### 1.4. Trying to read the payload as a node buffer anyway
 
 Now that we know that KCD save files are a sequence of compressed zlib blocks (except for the footer), the natural thing to do is to decompress the whole payload and to analyze it.
 
 For brevity we will not go into detail on the Python implementation, but the [`read_zlib_blocks.py`](read_zlib_blocks.py) script has a `--decompress` option that will create a new file next to the input save file, named after it with a `.decompressed.bin` extension, and containing all decompressed bytes, without the file footer.
 
-Let's take for example this dump of the first 142 bytes of a decompressed save payload (wrapped to 32 bytes per line):
-```hex
-14 00 00 00 F5 01 4E 01 00 00 0D 00 3E 01 00 00 00 00 00 00 01 00 00 00 10 64 70 67 00 00 00 00 
-72 61 74 61 6A 65 00 30 7C 31 7C 40 73 75 62 63 68 61 70 74 65 72 5F 32 39 38 5F 6E 61 6D 65 7C 
-40 6F 62 6A 65 63 74 69 76 65 5F 53 61 76 65 6E 61 6D 65 5F 31 7C 40 6C 6F 63 61 74 69 6F 6E 5F 
-53 6B 61 6C 69 63 65 7C 31 37 33 35 34 31 38 38 39 36 7C 32 38 2F 31 32 2F 32 30 32 34 20 32 31 
-3A 34 38 7C 30 2E 30 35 36 38 38 32 7C 00
+Let's take for example this dump of the first 192 bytes of a decompressed save payload (offsets are decimal):
+```
+    | 00 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+----+------------------------------------------------------------------------------------------------
+ 00 | 14 00 00 00 F5 01 4E 01 00 00 0D 00 3E 01 00 00 00 00 00 00 01 00 00 00 10 64 70 67 00 00 00 00 
+ 32 | 72 61 74 61 6A 65 00 30 7C 31 7C 40 73 75 62 63 68 61 70 74 65 72 5F 32 39 38 5F 6E 61 6D 65 7C 
+ 64 | 40 6F 62 6A 65 63 74 69 76 65 5F 53 61 76 65 6E 61 6D 65 5F 31 7C 40 6C 6F 63 61 74 69 6F 6E 5F 
+ 96 | 53 6B 61 6C 69 63 65 7C 31 37 33 35 34 31 38 38 39 36 7C 32 38 2F 31 32 2F 32 30 32 34 20 32 31 
+128 | 3A 34 38 7C 30 2E 30 35 36 38 38 32 7C 00 40 73 75 62 63 68 61 70 74 65 72 5F 32 39 38 5F 6E 61
+160 | 6D 65 7C 40 6F 62 6A 65 63 74 69 76 65 5F 53 61 76 65 6E 61 6D 65 5F 31 00 C8 00 00 00 C8 00 00
 ```
 
-Inspecting this decompressed payload in a hexadecimal viewer immediately shows a lot of readable strings (decoded as ANSI characters). For example, this sequence of 110 bytes starting at offset 32:
+Inspecting this decompressed payload in a hexadecimal viewer immediately shows a lot of readable strings (decoded as ANSI characters). For example, this sequence of 153 bytes starting at offset 32:
 ```
-rataje�0|1|@subchapter_298_name|@objective_Savename_1|@location_Skalice|1735418896|28/12/2024 21:48|0.056882|�
+rataje�0|1|@subchapter_298_name|@objective_Savename_1|@location_Skalice|1735418896|28/12/2024 21:48|0.056882|�@subchapter_298_name|@objective_Savename_1�
 ```
 
 Let's break it down:
@@ -557,9 +558,9 @@ Let's break it down:
 
 We are definitely on track!
 
-###### Trying to match CryEngine's save reading logic
+---
 
-Previously we saw that CryEngine expects the first "section" of the payload to be the "nodes buffer". But it does not parse the data on its own just yet. It does that after loading all data, in `CReader::CreateNodeAddressTables` (line 437). Inside, the most interesting part is the construction of a `CNodeLiveReader` object, and the call to its method `ActivateFromCompact`.
+In §1.2.1 we saw that CryEngine expects the first "section" of the payload to be the "node buffer". But it does not parse the data on its own just yet. It does that after loading all data, in `CReader::CreateNodeAddressTables` (line 437). Inside, the most interesting part is the construction of a `CNodeLiveReader` object, and the call to its method `ActivateFromCompact`.
 
 In `Code/CryEngine/CryAction/Serialization/XMLCPBin/Reader/XMLCPB_NodeLiveReader.cpp` at line 190 we can see that the code expects once again a header for each node. Here, it is the first 2 bytes, decoded as a `uint16`. The next lines suggest that this header is actually holding multiple flags that can be read with bit masking. Looking up those bit masks brings us back to `XMLCPB_Common.h`, at lines 177-225. There, a comment suggests that `CNodeLiveWriter::Compact` has an understandable description of the format of those nodes.
 
@@ -608,21 +609,23 @@ for (int a = 0; a < m_attrs.size(); ++a)
 
 A simple loop over all attributes of the node, calling `Compact` on each one. The implementation of `CAttrWriter::Compact` is in `Code/CryEngine/CryAction/Serialization/XMLCPBin/Writer/XMLCPB_AttrWriter.cpp` at lines 396-540.
 
-The code teaches us that "string" attributes (`case DT_STR` line 414) are not actually stored in compacted nodes. Only the string ID is encoded. There is an exception for strings longer than 1024 characters (see `CAttrWriter::Set` at lines 70-75) which are stored as raw data (`case DT_RAWDATA` line 528): the bytes are stored inline, prefixed by a `uint32` holding the size of the span. It means that our "nodes buffer" should rarely contain text, and if so, it should be encoded as raw data.
+The code teaches us that "string" attributes (`case DT_STR` line 414) are not actually stored in compacted nodes. Only the string ID is encoded. There is an exception for strings longer than 1024 characters (see `CAttrWriter::Set` at lines 70-75) which are stored as raw data (`case DT_RAWDATA` line 528): the bytes are stored inline, prefixed by a `uint32` holding the size of the span. It means that our "node buffer" should rarely contain text, and if so, it should be encoded as raw data.
 
-Yet, the readable string mentioned earlier (`rataje�0|1|@subchapter_298_name|...`) was found only 32 bytes into the payload. The longest run of readable characters is `0|1|@subchapter_298_name|@objective_Savename_1|@location_Skalice|1735418896|28/12/2024 21:48|0.056882|`, so only 102 characters, and the four preceding bytes (as `uint32`) do not decode as a valid size for this string either. We could also consider that the string starts at `rataje` instead, but the 4 preceding bytes decode as 0, which is also not the size of the string. This seems contradictory with it being part of the nodes buffer.
+Yet, the readable string mentioned earlier (`rataje�0|1|@subchapter_298_name|...`) was found only 32 bytes into the payload. The longest run of readable characters is `0|1|@subchapter_298_name|@objective_Savename_1|@location_Skalice|1735418896|28/12/2024 21:48|0.056882|`, so only 102 characters, and the four preceding bytes (as `uint32`) do not decode as a valid size for this string either. We could also consider that the string starts at `rataje` instead, but the 4 preceding bytes decode as 0, which is also not the size of the string. This seems contradictory with it being part of the node buffer.
 
 This string is long and meaningful, so we can also drop the hypothesis that those bytes decode to readable text by chance.
 
 Finally, if we consider the case where this text is contained in a larger raw data attribute, we should find a node header declaring that it has attributes. As we saw earlier, it would mean that we should find a span of 2 bytes whose most significant bit is 1 in little-endian order. Said differently, we should find a 2-byte span ranging from `?? 80` to `?? FF`, where `?` can be any hex digit. In our example, the only byte that is between `80` and `FF` that we could find before the string starts is `F5`, at offset 4. For `F5` to be the most significant byte of the node header, it would mean that the header starts with `00 F5`, at offset 3. This leaves only 3 bytes before it. In our example the first 2 bytes are `14 00`, meaning that this first node has no children and no attributes. Therefore the first node stops at 2 bytes. This leaves only 1 byte before offset 3, and as we said, a node header takes at least 2 bytes, so this is a contradiction. We can conclude that the text we see cannot be part of a node attribute.
 
-If this text is not part of the nodes buffer, it means that the nodes buffer takes at most 32 bytes in our example. Since each node takes at least 2 bytes, we have room for at most 16 nodes. This is highly unlikely.
+If this text is not part of the node buffer, it means that the node buffer takes at most 32 bytes in our example. Since each node takes at least 2 bytes, we have room for at most 16 nodes. This is highly unlikely.
 
-So... again, a dead end. It strongly suggests that Kingdom Come: Deliverance only uses the envelope of CryEngine's XMLCPB save format (the 64-byte footer and the zlib blocks).
+So... again, a dead end. It strongly suggests that Kingdom Come: Deliverance only uses the envelope of CryEngine's XMLCPB save format (the 64-byte footer and the zlib blocks). We must change our approach.
 
-###### Tinkering with the hexadecimal viewer
+## 2. Inspecting the raw bytes
 
-For reference, we will work on the same example as before, but extended to the first 192 bytes (offsets are decimal!):
+If the game engine's source code cannot explain the payload, we have to do it the hard way: inspect the raw bytes and try to make sense of them.
+
+For reference, we will work on the same example as before:
 ```
     | 00 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
 ----+------------------------------------------------------------------------------------------------
@@ -649,7 +652,9 @@ At this point we don't have many clues except that some readable text starts at 
 - Byte offsets, sizes and timestamps are exceptions to the previous point. Our example decompressed payload is 25+ MiB long; its last offset is 26,715,956. A contemporary timestamp is greater than 1,700,000,000 seconds, or 1,700,000,000,000 milliseconds (which does not fit in 32 bits).
 - A consequence of numbers tending to be rather small is that the most significant bytes of **positive** integers are often `00`. In little-endian, which is the convention we've seen everywhere so far, it means that their last bytes are zeros. For example, `26 1C 00 00` as a `uint32` is 7206. For **negative** integers, which are represented as signed integers with [two's complement](https://en.wikipedia.org/wiki/Two%27s_complement), they tend to be `FF`. For example, `EC F6 FF FF` as an `int32` is -2324.
 - Strings are usually a variable-length chain of bytes ending with a `NUL` character (`00`).
-- When data structures are plain copies of C or C++ objects they can include padding, as we saw in the first part of this guide.
+- When data structures are plain copies of C or C++ objects they can include padding, as described in §1.1.
+
+### 2.1. Carving out the general layout
 
 We can try selecting arbitrary byte spans and look at what they decode to. We can start cutting everything into 4-byte spans:
 
@@ -900,7 +905,7 @@ And here is the binary layout of the decompressed payload as we understand it so
 # .<label> as a byte span size references the <label> field in the same type, which must come earlier and be an unsigned integer.
 
 chunk :=
-    [      2 | typeId: unsigned integer]
+    [      2 | type: unsigned integer]
     [      4 | length: unsigned integer]
     [.length | value: chunk{1..*} or bytes]
 
