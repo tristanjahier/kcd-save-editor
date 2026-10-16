@@ -1,6 +1,14 @@
 # Reverse-engineering the binary format of Kingdom Come: Deliverance save files
 
-This guide was written using a sample of over a dozen actual save files made on the Windows version of Kingdom Come: Deliverance (the first one) version 1.9.6+.
+> [!NOTE]
+> This document was not written by an AI, and it is also not based on the findings of any AI, as opposed to [the initial research notes](initial-ai-research/reverse-engineering.md). AI was only used to proofread it and review the methodology.
+> This guide follows my journey as a reverse-engineering beginner.
+> It is not a final specification of the format of Kingdom Come: Deliverance saves. Instead, it justifies, step by step, how I came to understand the binary format.
+> In the rest of the guide, "we" invites you, the reader, to follow the investigation with me.
+>
+> This project is not affiliated with or endorsed by Warhorse Studios, Deep Silver or Crytek. Kingdom Come: Deliverance and CryEngine are trademarks of their respective owners.
+
+This guide bases its investigation on a sample of over a dozen actual save files made on the Windows version of Kingdom Come: Deliverance (the first one) version 1.9.6+.
 
 Saved games are `.whs` files located at `%USERPROFILE%\Saved Games\kingdomcome\saves\playline<N>`.
 
@@ -15,6 +23,9 @@ CryEngine 3 is a proprietary engine, its code is not public, and in 2026 it is h
 ---
 
 From now on, we will consider that we have been granted access to the source code of CryEngine 5 on GitHub. The reference version is 5.7.1 (the only one Crytek still distributes as of October 2026).
+
+> [!IMPORTANT]
+> The CryEngine code excerpts quoted in this guide are copyrighted by Crytek GmbH. They are kept short, limited to the relevant lines, and quoted only to explain the save format. The full source code is only available from Crytek, as described above.
 
 A quick search on file paths containing "save" inside `Code/CryEngine/` returns many results. One file and three directories stand out:
 - `Code/CryEngine/CryAction/ISaveGame.h`
