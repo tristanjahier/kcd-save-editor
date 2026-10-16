@@ -897,7 +897,7 @@ struct Chunk {
 Chunk my_pattern[while($ + 6 <= std::mem::size())] @ 0x04;
 ```
 
-A refined, ready-to-use Python script that parses the chunk tree from a decompressed payload is available in [`read_decompressed_payload.py`](read_decompressed_payload.py).
+A refined, ready-to-use Python script that parses the chunk tree from a decompressed payload is available in [`parse_decompressed_payload.py`](parse_decompressed_payload.py).
 
 And here is the binary layout of the decompressed payload as we understand it so far:
 ```
@@ -921,3 +921,260 @@ What remains to be figured out:
 - how to read chunk values when they are not nested chunks;
 - whether child chunks can cohabit with other data, and whether those children must come first or not;
 - what `undetermined1` and `undetermined2` are for.
+
+### 2.2. Decoding the first chunk
+
+We got the general layout right. Now let's get back to the first root chunk we inspected (type: 501), and in particular its first child (type: 13).
+
+#### 2.2.1. The save timestamp
+
+We already settled that span [24-27] is a timestamp. Additionally, in all sample saves, the next 4 bytes are always all zeros. We supposed that it could be a 0 value as a `uint32`, or padding.
+
+There is another possible interpretation: those are the high bytes of a 64-bit timestamp. Indeed, timestamps were traditionally stored using a _signed integer on 32 bits_ (`time_t`), which cannot store [a date beyond 2038-01-19 03:14:07 UTC](https://en.wikipedia.org/wiki/Year_2038_problem) (2^31 - 1 seconds). In modern days, as this date is not very far anymore, developers prefer representing timestamps on 64 bits. [MSVC's documentation says that by default it is a 64-bit signed integer](https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/time-time32-time64?view=msvc-140).
+
+There is actually a decisive test that we can do quite easily:
+
+1. change the date in Windows' settings past 2038-01-19 03:14:07 UTC;
+2. launch KCD and load a sample game;
+3. save;
+4. quit the game and inspect this save to see if the 8 bytes decode to the correct date.
+
+If we do it, we see that the game works normally, and that the save appears with its correct date (year 2039) in the loading menu, meaning that the game supports it well.
+
+However, any date up to 2106-02-07 06:28:15 UTC can be stored on just 32 bits if it is read as an unsigned integer. The better proof would be to set the date past that limit, and see if the 4 next bytes actually change. 
+
+It may not be possible to set the date to 2126 in Windows' date & time settings, though it can be done via a PowerShell command run in administrator mode:
+```pwsh
+Set-Date -Date ([datetime]::new(2126, 6, 15, 10, 0, 0, [DateTimeKind]::Utc).ToLocalTime())
+```
+
+Using the same test protocol, we can demonstrate that the game still runs normally, creates a save on the date set, and that inspecting its decompressed payload shows a value on more than 4 bytes, which translates correctly to the date set. For example: `54 8F 47 26 01 00 00 00` which decodes as "2126-06-15 10:00:52 UTC".
+
+We proved that span [24-31] is a single 64-bit timestamp.
+
+Caveat: setting a date prior to 1970-01-01 systematically crashes the game, so we cannot test how the game handles negative timestamps.
+
+#### 2.2.2. The two leading integers
+
+In chunk (type: 13), before the timestamp there are 8 bytes ([16-23]) that look like two 32-bit integers.
+
+Let's check their values in our sample saves:
+
+| Save Name                | Bytes [16-19]     | Bytes [20-23]         |
+| ------------------------ | ----------------- | --------------------- |
+| permanent001 (reference) | `00 00 00 00` (0) | `01 00 00 00` (1)     |
+| permanent004             | `00 00 00 00` (0) | `04 00 00 00` (4)     |
+| permanent011             | `00 00 00 00` (0) | `0B 00 00 00` (11)    |
+| permanent013             | `00 00 00 00` (0) | `0D 00 00 00` (13)    |
+| save508                  | `02 00 00 00` (2) | `FC 01 00 00` (508)   |
+| save669                  | `02 00 00 00` (2) | `9D 02 00 00` (669)   |
+| switch51141              | `06 00 00 00` (6) | `C5 C7 00 00` (51141) |
+
+For bytes [20-23], the results are obvious: it is the save number.
+
+For bytes [16-19], it looks like each naming scheme has its own number. We should verify that on other saves including all known naming schemes:
+
+| Save Name   | Bytes [16-19]     | Bytes [20-23]         |
+| ----------- | ----------------- | --------------------- |
+| save573     | `02 00 00 00` (2) | `3D 02 00 00` (573)   |
+| autosave692 | `01 00 00 00` (1) | `B4 02 00 00` (692)   |
+| autosave694 | `01 00 00 00` (1) | `B6 02 00 00` (694)   |
+| exit        | `05 00 00 00` (5) | `A6 02 00 00` (678)   |
+
+
+It confirms that each save naming scheme is bound to a different number.
+
+Using the game as a source of truth, and inspecting the save entries in the game menu, we can determine what those naming schemes stand for:
+
+| Naming Scheme | Scheme code  | Description                                                                           |
+| :------------ | :----------: | :------------------------------------------------------------------------------------ |
+| permanentNNN  | 0            | Automatic saves at important moments of the main story line. Those seem to never be deleted, as their name suggests. |
+| autosaveNNN   | 1            | Automatic saves made during side quests and secondary objectives, or, oddly enough, manual saves made by sleeping in a bed or on a pallet. |
+| saveNNN       | 2            | Manual saves, made by drinking a Saviour Schnapps.                                    |
+| exit          | 5            | A save made when the player clicks "Save & Quit" in the main menu. Overwritten on each new "Save & Quit". The save number is not part of the file name, confirming that there is only one "exit" save at a time. |
+| switchNNNNN   | 6            | Trickier, because it does not appear in-game. But by comparing its creation time and the immediate next save, we can determine that it is created just before entering the story of Theresa in Skalitz (DLC 4 "A Woman's Lot"). Its save number does not follow the rest. |
+
+Those naming schemes indicate in fact different types of saves. In our samples, codes 3 and 4 never appeared.
+
+Conclusion: span [16-19] is the **save type code**, and span [20-23] is the **save number**.
+
+#### 2.2.3. The strings
+
+Next in chunk (type: 13), starting at offset 32, we have the NUL-terminated strings that we already mentioned in §1.4:
+
+| Save | Decoded strings |
+| --- | --- |
+| permanent001 | <ol><li>rataje</li><li>0\|1\|@subchapter_298_name\|@objective_Savename_1\|@location_Skalice\|1735418896\|28/12/2024 21:48\|0.056882\|</li><li>@subchapter_298_name\|@objective_Savename_1</li></ol> |
+| permanent004 | <ol><li>rataje</li><li>0\|4\|@subchapter_313_name\|@objective_Savename_1\|@location_Skalice\|1735498563\|29/12/2024 19:56\|3.119182\|</li><li>@subchapter_313_name\|@objective_Savename_1</li></ol> |
+| permanent011 | <ol><li>rataje</li><li>0\|11\|@subchapter_370_name\|@objective_Savename_1\|@location_Rovne\|1735511361\|29/12/2024 23:29\|4.558275\|</li><li>@subchapter_370_name\|@objective_Savename_1</li></ol> |
+| permanent013 | <ol><li>rataje</li><li>0\|13\|@subchapter_382_name\|@objective_39219_Savename\|@location_Mlyn_Rataje\|1735515642\|30/12/2024 00:40\|5.747488\|</li><li>@subchapter_382_name\|@objective_39219_Savename</li></ol> |
+| save508 | <ol><li>rataje</li><li>2\|508\|@subchapter_586_name\|\|@ui_countryside\|1755694805\|20/08/2025 15:00\|136.540985\|</li><li>_(empty)_</li></ol> |
+| save646 | <ol><li>rataje_dlc4</li><li>2\|646\|@subchapter_672_name\|\|@ui_countryside\|1757799018\|13/09/2025 23:30\|169.340225\|</li><li>_(empty)_</li></ol> |
+| autosave692 | <ol><li>rataje</li><li>1\|692\|@subchapter_348_name\|\|@location_pribyslavice_newHomes\|1758050379\|16/09/2025 21:19\|185.985489\|</li><li>_(empty)_</li></ol> |
+| autosave694 | <ol><li>rataje</li><li>1\|694\|@subchapter_348_name\|\|@location_Ledecko\|1758053283\|16/09/2025 22:08\|186.115067\|</li><li>_(empty)_</li></ol> |
+| autosave786 | <ol><li>rataje</li><li>1\|786\|@subchapter_588_name\|@objective_36861_Savename\|@location_Mlyn_Rataje\|1769450839\|26/01/2026 19:07\|203.192307\|</li><li>@subchapter_588_name\|@objective_36861_Savename</li></ol> |
+| switch51141 | <ol><li>rataje</li><li>6\|51141\|@subchapter_385_name\|\|@location_Mlyn_Rataje\|1757695927\|12/09/2025 18:52\|163.495087\|</li><li>_(empty)_</li></ol> |
+| exit | <ol><li>rataje</li><li>5\|678\|@subchapter_348_name\|\|@location_Rataje\|1757978362\|16/09/2025 01:19\|181.004288\|</li><li>_(empty)_</li></ol> |
+
+The first string is always "rataje" in all sample saves, except in saves made during the story of Theresa, where it is "rataje_dlc4". So it is very probably the name of the game level/map.
+
+The second string is a vertical-bar-separated data structure. We need to break it down again and compare the values between different saves:
+
+| Save         | 1 | 2     | 3                    | 4                         | 5                               | 6          | 7                | 8          |
+| ------------ | - | ----: | -------------------- | ------------------------- | ------------------------------- | ---------- | ---------------- | ---------: |
+| permanent001 | 0 |     1 | @subchapter_298_name | @objective_Savename_1     | @location_Skalice               | 1735418896 | 28/12/2024 21:48 | 0.056882   |
+| permanent004 | 0 |     4 | @subchapter_313_name | @objective_Savename_1     | @location_Skalice               | 1735498563 | 29/12/2024 19:56 | 3.119182   |
+| permanent011 | 0 |    11 | @subchapter_370_name | @objective_Savename_1     | @location_Rovne                 | 1735511361 | 29/12/2024 23:29 | 4.558275   |
+| permanent013 | 0 |    13 | @subchapter_382_name | @objective_39219_Savename | @location_Mlyn_Rataje           | 1735515642 | 30/12/2024 00:40 | 5.747488   |
+| save508      | 2 |   508 | @subchapter_586_name |                           | @ui_countryside                 | 1755694805 | 20/08/2025 15:00 | 136.540985 |
+| save646      | 2 |   646 | @subchapter_672_name |                           | @ui_countryside                 | 1757799018 | 13/09/2025 23:30 | 169.340225 |
+| autosave692  | 1 |   692 | @subchapter_348_name |                           | @location_pribyslavice_newHomes | 1758050379 | 16/09/2025 21:19 | 185.985489 |
+| autosave694  | 1 |   694 | @subchapter_348_name |                           | @location_Ledecko               | 1758053283 | 16/09/2025 22:08 | 186.115067 |
+| autosave786  | 1 |   786 | @subchapter_588_name | @objective_36861_Savename | @location_Mlyn_Rataje           | 1769450839 | 26/01/2026 19:07 | 203.192307 |
+| switch51141  | 6 | 51141 | @subchapter_385_name |                           | @location_Mlyn_Rataje           | 1757695927 | 12/09/2025 18:52 | 163.495087 |
+| exit         | 5 |   678 | @subchapter_348_name |                           | @location_Rataje                | 1757978362 | 16/09/2025 01:19 | 181.004288 |
+
+Interpretations are quite easy:
+
+1. The save type code that we uncovered in the previous section.
+2. The save number that we also uncovered in the previous section.
+3. A localized string key for the current "subchapter", probably the quest.
+4. A localized string key for the current quest objective. Sometimes empty.
+5. A localized string key for the current location.
+6. The save timestamp.
+7. The save timestamp as local date & time.
+8. This one is ever growing with the save number (except the switch save). A quick check in game will reveal that it is the number of hours played.
+
+Note that there is always a vertical bar after the last element, but none at the beginning. This might just be a quirk of the format, or a sign that a 9th element exists but is always empty.
+
+Caveat: the timestamp in field 6 very likely goes through a 32-bit signed integer before serialization, because in the saves dated 2039 and 2126 (see §2.2.1) it reads -2092824325 (1903-09-07) and 642223956 (1990-05-09), respectively, when it should have been 2202142971 (2039-10-13) and 4937191252 (2126-06-15).
+
+The third string is always present, but it is sometimes empty, consisting of just a NUL byte. When it is not empty, it simply repeats fields 3 and 4 from the second string. This one would probably require further investigation to be understood.
+
+#### 2.2.4. The other strings
+
+Next in chunk (type: 13) we can spot other NUL-terminated strings: `Tr��sors du pass��`, `L'essor du ph��nix`, `Les Galantes Aventures du Courtois Hans Capon`, `Mauvaise troupe`, `Le lot des femmes`. These happen to be all of Kingdom Come: Deliverance's playable DLCs, in French. The replacement characters indicate that they do not decode properly in ASCII; they must be decoded in UTF-8:
+
+- Trésors du passé (Treasures of the Past)
+- L'essor du phénix (From the Ashes)
+- Les Galantes Aventures du Courtois Hans Capon (The Amorous Adventures of Bold Sir Hans Capon)
+- Mauvaise troupe (Band of Bastards)
+- Le lot des femmes (A Woman's Lot)
+
+Before those DLC strings, there are always exactly 15 bytes:
+
+| Save         | Bytes                                          |
+| ------------ | ---------------------------------------------- |
+| permanent001 | `C8 00 00 00 C8 00 00 00 00 05 00 01 00 00 00` |
+| permanent004 | `C8 00 00 00 C8 00 00 00 01 05 00 01 00 00 00` |
+| permanent011 | `C8 00 00 00 C8 00 00 00 01 05 00 01 00 00 00` |
+| permanent013 | `C8 00 00 00 C8 00 00 00 01 05 00 01 00 00 00` |
+| save508      | `C8 00 00 00 C8 00 00 00 01 05 00 01 00 00 00` |
+| save646      | `C8 00 00 00 C8 00 00 00 01 05 00 01 00 00 00` |
+| autosave692  | `C8 00 00 00 C8 00 00 00 01 05 00 01 00 00 00` |
+| autosave694  | `C8 00 00 00 C8 00 00 00 01 05 00 01 00 00 00` |
+| switch51141  | `C8 00 00 00 C8 00 00 00 01 05 00 01 00 00 00` |
+| exit         | `C8 00 00 00 C8 00 00 00 01 05 00 01 00 00 00` |
+
+They are all identical except for the first one where its 9th byte is `00` instead of `01`.
+
+The DLC strings themselves are separated by other undetermined bytes, in that order:
+
+- Trésors du passé
+- `04 00 00 00`
+- L'essor du phénix
+- `08 00 00 00`
+- Les Galantes Aventures du Courtois Hans Capon
+- `09 00 00 00`
+- Mauvaise troupe
+- `0A 00 00 00`
+- Le lot des femmes
+
+The chunk terminates exactly after the last string. With hindsight, it probably means that the last 4 bytes of the 15-byte prefix should be associated with the first DLC title instead: `01 00 00 00` and "Trésors du passé".
+
+Those separator byte spans are always 4 bytes, which looks like a 32-bit integer. They are surely not sizes, since they never correspond to the number of characters, nor bytes, of the string they precede. Also NUL-terminated strings typically do not need a size prefix. They could be IDs of the DLCs. A quick check on other saves shows that they never change, which strengthens that hypothesis.
+
+What could be the first 11 bytes then?
+
+`C8 00 00 00` as a 32-bit integer is 200. Twice. Still cryptic.
+
+The fact that the 9th byte changes from `00` to `01`, but not its surrounding bytes, hints that it might be a boolean. The save where this byte is `00`, permanent001, is the only one of our samples that takes place before the village of Skalitz is attacked by the Cumans, so it could be a flag for that.
+
+And the last two bytes, `05 00`, could simply be a 16-bit integer: 5, exactly the number of DLCs listed afterwards. DLCs can be installed individually, so a field containing the number of DLCs that follow would make sense. In fact, starting a new playline with one of the DLCs uninstalled confirms that the 16-bit integer is indeed the number of DLCs, and that the list contains only the currently installed DLCs.
+
+#### 2.2.5. Summary of chunk (type: 13)
+
+All things put together, here is the provisional shape of chunk (type: 13) in an informal grammar, as we understand it so far:
+
+```
+# legend (in addition to previous grammars):
+# repeated group of byte spans: ( <span 1> <span 2> ... ){cardinality}
+# .<label> as cardinality references the <label> field in the same type, which must come earlier and be an unsigned integer.
+# primitive type string: NUL-terminated string (encoding can be specified in parentheses).
+
+save-info := 
+    [4 | save_type: unsigned integer]
+    [4 | save_number: unsigned integer]
+    [8 | timestamp: signed integer]
+    [? | map: string]
+    [? | serialized_info: string]
+    [? | serialized_info_2: string]
+    [4 | undetermined_1: unsigned integer]
+    [4 | undetermined_2: unsigned integer]
+    [1 | skalitz_burnt: boolean]  # provisional meaning
+    [2 | dlc_count: unsigned integer]
+    (
+        [4 | dlc_id: unsigned integer]
+        [? | dlc_title: string(utf8)]  # localized
+    ){.dlc_count}
+```
+
+Note: it is the only chunk of type 13 across the whole payload.
+
+#### 2.2.6. The little sibling (type: 16)
+
+Across all sample saves, its length is always 4 bytes and its value `01 00 00 00`. It is the only chunk of type 16 across the whole payload.
+
+A constant value tells us nothing about its meaning.
+
+#### 2.2.7. The secret sibling (type: 17)
+
+`save646` is our only sample from Theresa's story (DLC 4 "A Woman's Lot"), but the observations stated below hold for all the saves of that story that we could produce and check.
+
+In `save646` there is an additional child under root chunk (type: 501): chunk (type: 17; length: 4). Its value is a 4-byte integer, `C5 C7 00 00`, which decodes to 51141. It is exactly the number of the latest "switch" save at that time.
+
+Saves of Theresa's story are typically much smaller than the others, suggesting that they do not contain the state of the main storyline. When the player enters her storyline, no visible new entry appears in the loading menu. Yet, after finishing the DLC, the state of the main storyline is restored exactly as it was, even if the game was closed and restarted in between. So the main storyline must be stored somewhere.
+
+A safe conclusion is that, when entering Theresa's story, the game creates a special "switch" save holding the state of the main storyline. That "switch" save's number is then referenced in DLC-specific saves, in chunk (type: 17), in order to restore the main storyline seamlessly after finishing the DLC.
+
+#### 2.2.8. The new sibling (type: 14)
+
+All saves created while the game has loaded mods have a special chunk (type: 14) to hold mod information. We do not need to go into too much detail for this one, as the layout is pretty obvious, and as no new knowledge is required to parse the bytes.
+
+The first 4 bytes are a `uint32` holding the number of registered mods.
+
+Then it is a series of NUL-terminated strings for each mod in that order:
+
+1. the name of the mod folder
+2. the mod name
+3. the description
+4. the author
+5. the version
+6. the version (again)
+
+Fields 2 to 5 come from the `mod.manifest`.
+
+Note: once a mod has been registered in a save, it will never disappear from subsequent saves, even if it has been uninstalled since. Also, each new version of a preexisting mod simply appends to the end of the list. In this regard it acts as a history of mods rather than a list of the mods loaded when the game was saved.
+
+Caveat: in rare and abnormal circumstances, all these strings but the mod folder name can be empty and then consist of just a NUL character. When a folder exists in the game's Mods directory it is seen as a mod by the game, even if it is empty, as long as it is declared in `mod_order.txt` or this file does not exist.
+
+#### 2.2.9. Conclusion
+
+The root chunk (type: 501) is present in all saves. It consists of:
+
+- Chunk (type: 13): Save information: number, type, timestamp, game level/map, the DLCs installed etc.
+- Chunk (type: 16): Undetermined meaning.
+- _OPTIONAL_ Chunk (type: 17): Present only when the save is from Theresa's storyline. Its value is the number of the "switch" save from the main storyline.
+- _OPTIONAL_ Chunk (type: 14): Present when mods have been installed. It lists information about the registered mods.
+
+A refined, ready-to-use Python script that reads the root chunk (type: 501) from a decompressed payload is available in [`read_save_metadata.py`](read_save_metadata.py).
